@@ -8,17 +8,32 @@
 #include <mutex>
 #include <unordered_map>
 #include <iomanip>
-#include <sys/stat.h>
-#include <ctime>
+#include <filesystem>
+#include <stdexcept>
+#include <csignal>
+#include <future>
+#include <random>
+#include <algorithm>
+
+namespace fs = std::filesystem;
+
+class ConfigurationError : public std::runtime_error {
+public:
+    ConfigurationError(const std::string& message) : std::runtime_error(message) {}
+};
+
+class HashMismatchError : public std::runtime_error {
+public:
+    HashMismatchError(const std::string& message) : std::runtime_error(message) {}
+};
+
 
 class FileIntegrityMonitor {
 private:
     struct FileInfo {
-        std::string path;
         std::string hash;
-        std::chrono::system_clock::time_point lastCheck;
-        uintmax_t size;
-        time_t modTime;
+        std::uintmax_t size;
+        std::time_t modTime;
     };
 
     std::unordered_map<std::string, FileInfo> fileRegistry;
@@ -26,178 +41,287 @@ private:
     std::vector<std::string> criticalPaths;
     bool isRunning;
     int scanIntervalSeconds;
+    std::ofstream logFile;
+    std::string logFilePath;
+    std::hash<std::string> stringHasher;
+    std::random_device rd;
+    std::mt19937 gen;
+    std::uniform_int_distribution<> distrib;
 
-    uintmax_t getFileSize(const std::string& filePath) {
-        struct stat statbuf;
-        if (stat(filePath.c_str(), &statbuf) != 0) {
-            return 0;
-        }
-        return statbuf.st_size;
+    void logMessage(const std::string& message) {
+        std::lock_guard<std::mutex> lock(registryMutex);
+        auto now = std::chrono::system_clock::now();
+        auto now_c = std::chrono::system_clock::to_time_t(now);
+        std::tm now_tm = *std::localtime(&now_c);
+        logFile << "[" << std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S") << "] " << message << std::endl;
+        std::cerr << "[" << std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S") << "] " << message << std::endl;
+
     }
 
-    time_t getLastModifiedTime(const std::string& filePath) {
-        struct stat statbuf;
-        if (stat(filePath.c_str(), &statbuf) != 0) {
+
+    std::uintmax_t getFileSize(const std::string& filePath) {
+        try {
+            return fs::file_size(filePath);
+        } catch (const fs::filesystem_error& e) {
+            logMessage("Error getting file size for " + filePath + ": " + e.what());
             return 0;
         }
-        return statbuf.st_mtime;
     }
+
+    std::time_t getLastModifiedTime(const std::string& filePath) {
+        try {
+            return fs::last_write_time(filePath).time_since_epoch().count() / std::chrono::system_clock::period::den;
+        } catch (const fs::filesystem_error& e) {
+             logMessage("Error getting last modified time for " + filePath + ": " + e.what());
+            return 0;
+        }
+    }
+
 
     bool fileExists(const std::string& filePath) {
-        struct stat statbuf;
-        return (stat(filePath.c_str(), &statbuf) == 0);
+        return fs::exists(filePath);
     }
 
-    std::string calculateSimpleHash(const std::string& filePath) {
+
+    std::string calculateHash(const std::string& filePath) {
         std::ifstream file(filePath, std::ios::binary);
         if (!file) {
-            std::cerr << "Erro ao abrir arquivo: " << filePath << std::endl;
-            return "";
+            logMessage("Error opening file: " + filePath);
+            throw std::runtime_error("Failed to open file for hashing: " + filePath);
         }
 
-        const size_t bufferSize = 8192;
-        char buffer[bufferSize];
-        uint64_t hash = 0x1505; 
-
-        while (file.read(buffer, bufferSize)) {
-            size_t count = file.gcount();
-            for (size_t i = 0; i < count; ++i) {
-                hash ^= static_cast<uint64_t>(buffer[i]) << 8;
-                hash = (hash << 7) | (hash >> 57); 
-                hash *= 0x100000001b3; 
-        }
-
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        std::string content = buffer.str();
+        size_t hashValue = stringHasher(content);
         std::stringstream ss;
-        ss << std::hex << std::setfill('0') << std::setw(16) << hash;
+        ss << std::hex << hashValue;
         return ss.str();
     }
 
+
     bool hasFileChanged(const std::string& path, const FileInfo& oldInfo) {
         try {
-            auto currentSize = getFileSize(path);
-            auto currentTime = getLastModifiedTime(path);
+            std::uintmax_t currentSize = getFileSize(path);
+            std::time_t currentTime = getLastModifiedTime(path);
 
-            // Primeiro verifica mudanças no tamanho e timestamp
             if (currentSize != oldInfo.size || currentTime != oldInfo.modTime) {
                 return true;
             }
 
-            // Se houver mudança nos metadados, calcula o hash
-            std::string currentHash = calculateSimpleHash(path);
+            std::string currentHash = calculateHash(path);
             return currentHash != oldInfo.hash;
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Erro ao verificar arquivo " << path << ": " << e.what() << std::endl;
-            return true; 
+        } catch (const std::exception& e) {
+             logMessage("Error checking file " + path + ": " + e.what());
+            return true;
         }
     }
 
+    void handleFileChange(const std::string& path) {
+        logMessage("ALERT: Change detected in: " + path);
+    }
+
+    void handleFileRemoval(const std::string& path) {
+         logMessage("ALERT: File removed or inaccessible: " + path);
+    }
+
+    void reinitializeFile(const std::string& path) {
+        try {
+            if (!fileExists(path)) {
+                 logMessage("ALERT: File disappeared: " + path);
+                fileRegistry.erase(path);
+                return;
+            }
+
+            FileInfo info;
+            info.hash = calculateHash(path);
+            info.size = getFileSize(path);
+            info.modTime = getLastModifiedTime(path);
+
+            fileRegistry[path] = info;
+             logMessage("File re-initialized: " + path);
+
+        } catch (const std::exception& e) {
+            logMessage("Error re-initializing file " + path + ": " + e.what());
+        }
+    }
+
+    bool isPathSafe(const std::string& path) {
+        if (path.empty()) return false;
+        if (path.find("..") != std::string::npos) return false;
+        if (path.find(":") != std::string::npos && path.find("C:") == std::string::npos) return false;
+        return true;
+    }
+
+
+
 public:
-    FileIntegrityMonitor(const std::vector<std::string>& paths, int interval = 60)
-        : criticalPaths(paths), isRunning(false), scanIntervalSeconds(interval) {
+    FileIntegrityMonitor(const std::vector<std::string>& paths, int interval = 60, const std::string& logPath = "fim.log")
+        : criticalPaths(paths), isRunning(false), scanIntervalSeconds(interval), logFilePath(logPath),
+          gen(rd()), distrib(1, 100) {
+         logFile.open(logFilePath, std::ios::app);
+        if (!logFile.is_open()) {
+            throw ConfigurationError("Failed to open log file: " + logFilePath);
+        }
+
+        for (const auto& path : criticalPaths) {
+            if (!isPathSafe(path)) {
+                throw ConfigurationError("Unsafe path detected: " + path);
+            }
+        }
+
         initializeRegistry();
     }
+
+    ~FileIntegrityMonitor() {
+        stop();
+        if (logFile.is_open()) {
+            logFile.close();
+        }
+    }
+
+
 
     void initializeRegistry() {
         std::lock_guard<std::mutex> lock(registryMutex);
         for (const auto& path : criticalPaths) {
-            if (fileExists(path)) {
-                FileInfo info{
-                    path,
-                    calculateSimpleHash(path),
-                    std::chrono::system_clock::now(),
-                    getFileSize(path),
-                    getLastModifiedTime(path)
-                };
-                fileRegistry[path] = info;
-                std::cout << "Arquivo registrado: " << path << std::endl;
-            }
-            else {
-                std::cerr << "Arquivo não encontrado: " << path << std::endl;
+            try {
+                if (fileExists(path)) {
+                    FileInfo info;
+                    info.hash = calculateHash(path);
+                    info.size = getFileSize(path);
+                    info.modTime = getLastModifiedTime(path);
+                    fileRegistry[path] = info;
+                     logMessage("File registered: " + path);
+                } else {
+                     logMessage("File not found: " + path);
+                }
+            } catch (const std::exception& e) {
+                 logMessage("Error initializing file " + path + ": " + e.what());
             }
         }
     }
 
     void start() {
-        isRunning = true;
-        std::cout << "Iniciando monitoramento de arquivos..." << std::endl;
+        if (isRunning) return;
 
-        while (isRunning) {
-            checkIntegrity();
-            std::this_thread::sleep_for(std::chrono::seconds(scanIntervalSeconds));
-        }
+        isRunning = true;
+         logMessage("Starting file monitoring...");
+
+        std::thread monitoringThread([this]() {
+            while (isRunning) {
+                try {
+                    checkIntegrity();
+                } catch (const std::exception& e) {
+                     logMessage("Exception during integrity check: " + std::string(e.what()));
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(scanIntervalSeconds));
+            }
+        });
+
+        monitoringThread.detach();
     }
 
     void stop() {
+        if (!isRunning) return;
         isRunning = false;
-        std::cout << "Parando monitoramento de arquivos..." << std::endl;
+         logMessage("Stopping file monitoring...");
     }
+
 
     void checkIntegrity() {
         std::lock_guard<std::mutex> lock(registryMutex);
 
-        for (auto& pair : fileRegistry) {
-            const std::string& path = pair.first;
-            FileInfo& info = pair.second;
+        std::vector<std::string> filesToCheck;
+        for (const auto& pair : fileRegistry) {
+            filesToCheck.push_back(pair.first);
+        }
+
+        for (const auto& path : filesToCheck) {
+            auto it = fileRegistry.find(path);
+            if (it == fileRegistry.end()) continue;
+
+            FileInfo& info = it->second;
 
             if (!fileExists(path)) {
-                std::cerr << "ALERTA: Arquivo removido ou inacessível: " << path << std::endl;
+                handleFileRemoval(path);
+                fileRegistry.erase(it);
                 continue;
             }
 
             if (hasFileChanged(path, info)) {
-                std::cout << "ALERTA: Alteração detectada em: " << path << std::endl;
-
-                info.hash = calculateSimpleHash(path);
-                info.lastCheck = std::chrono::system_clock::now();
-                info.size = getFileSize(path);
-                info.modTime = getLastModifiedTime(path);
+                handleFileChange(path);
+                reinitializeFile(path);
             }
         }
     }
 
+
     bool addFile(const std::string& path) {
+        if (!isPathSafe(path)) {
+             logMessage("Unsafe path, cannot add file: " + path);
+            return false;
+        }
+
         if (!fileExists(path)) {
-            std::cerr << "Arquivo não existe: " << path << std::endl;
+             logMessage("File does not exist: " + path);
             return false;
         }
 
         std::lock_guard<std::mutex> lock(registryMutex);
         try {
-            FileInfo info{
-                path,
-                calculateSimpleHash(path),
-                std::chrono::system_clock::now(),
-                getFileSize(path),
-                getLastModifiedTime(path)
-            };
+            FileInfo info;
+            info.hash = calculateHash(path);
+            info.size = getFileSize(path);
+            info.modTime = getLastModifiedTime(path);
 
             fileRegistry[path] = info;
-            std::cout << "Novo arquivo adicionado ao monitoramento: " << path << std::endl;
+             logMessage("New file added to monitoring: " + path);
             return true;
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Erro ao adicionar arquivo: " << e.what() << std::endl;
+        } catch (const std::exception& e) {
+             logMessage("Error adding file: " + std::string(e.what()));
             return false;
         }
     }
 };
 
+
+
+bool shouldExit = false;
+
+void signalHandler(int signal) {
+    if (signal == SIGINT || signal == SIGTERM) {
+        std::cerr << "Signal received, exiting..." << std::endl;
+        shouldExit = true;
+    }
+}
+
+
 int main() {
     try {
-      
-        std::vector<std::string> paths = {
-            "C:\\Windows\\System32\\drivers\\etc\\hosts",
-            "C:\\Windows\\System32\\drivers\\etc\\services"
-        };
+        std::signal(SIGINT, signalHandler);
+        std::signal(SIGTERM, signalHandler);
 
-        FileIntegrityMonitor monitor(paths, 60);
+        std::vector<std::string> paths;
+        paths.push_back("/etc/hosts");
+        paths.push_back("/etc/services");
+        paths.push_back("/etc/passwd");
 
-        // Inicia o monitoramento
+        FileIntegrityMonitor monitor(paths, 60, "fim.log");
+
         monitor.start();
-    }
-    catch (const std::exception& e) {
-        std::cerr << "Erro: " << e.what() << std::endl;
+
+        while (!shouldExit) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+
+        monitor.stop();
+
+    } catch (const ConfigurationError& e) {
+        std::cerr << "Configuration error: " << e.what() << std::endl;
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "Unhandled exception: " << e.what() << std::endl;
         return 1;
     }
 
